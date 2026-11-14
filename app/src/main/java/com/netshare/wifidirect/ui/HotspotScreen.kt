@@ -41,6 +41,7 @@ import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.filled.WifiTethering
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -59,6 +60,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -81,6 +84,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.netshare.wifidirect.BuildConfig
+import com.netshare.wifidirect.client.ClientConnectionStatus
+import com.netshare.wifidirect.client.ClientUiState
 import com.netshare.wifidirect.model.ConnectedClient
 import com.netshare.wifidirect.model.HotspotBand
 import com.netshare.wifidirect.model.HotspotStatus
@@ -99,11 +104,18 @@ import com.netshare.wifidirect.util.GitHubReleaseInfo
 import com.netshare.wifidirect.util.GitHubUpdateChecker
 import kotlinx.coroutines.launch
 
+enum class AppMode {
+    HOST, CLIENT
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun HotspotScreen(
     state: HotspotUiState,
+    clientState: ClientUiState,
     onToggleHotspot: () -> Unit,
+    onToggleClient: (host: String, port: Int) -> Unit,
+    onClearClientLogs: () -> Unit,
     onUpdateSsidSuffix: (String) -> Unit,
     onUpdatePassphrase: (String) -> Unit,
     onUpdateBand: (HotspotBand) -> Unit,
@@ -116,6 +128,7 @@ fun HotspotScreen(
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
+    var selectedMode by rememberSaveable { mutableStateOf(AppMode.HOST) }
     var showQrSheet by rememberSaveable { mutableStateOf(false) }
     var showPassword by rememberSaveable { mutableStateOf(false) }
     var showLogs by rememberSaveable { mutableStateOf(true) }
@@ -292,72 +305,142 @@ fun HotspotScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.WifiTethering,
-                            contentDescription = null,
-                            tint = if (isRunning) Emerald400 else Sky400
-                        )
-                        Column {
-                            Text(
-                                text = "NetShare Direct",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold
+            Column {
+                TopAppBar(
+                    title = {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (selectedMode == AppMode.HOST) Icons.Default.WifiTethering else Icons.Default.VpnKey,
+                                contentDescription = null,
+                                tint = if (selectedMode == AppMode.HOST) {
+                                    if (isRunning) Emerald400 else Sky400
+                                } else {
+                                    if (clientState.status == ClientConnectionStatus.CONNECTED) Emerald400 else Sky400
+                                }
                             )
-                            Text(
-                                text = "Wi-Fi Direct Hotspot • Built-in DHCP & NAT",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                },
-                actions = {
-                    IconButton(onClick = {
-                        showUpdateDialog = true
-                        if (updateResult == null && !isCheckingUpdate) {
-                            isCheckingUpdate = true
-                            coroutineScope.launch {
-                                updateResult = GitHubUpdateChecker.checkForUpdate(
-                                    owner = repoOwnerInput,
-                                    repo = repoNameInput,
-                                    token = repoTokenInput.ifEmpty { null }
+                            Column {
+                                Text(
+                                    text = "NetShare Direct",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold
                                 )
-                                isCheckingUpdate = false
+                                Text(
+                                    text = if (selectedMode == AppMode.HOST) {
+                                        "Host Hotspot • Wi-Fi Direct & Gateway"
+                                    } else {
+                                        "Client Mode • All-Traffic Direct Tunnel"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
                         }
-                    }) {
-                        Icon(
-                            imageVector = Icons.Default.CloudDownload,
-                            contentDescription = "Check for updates from GitHub"
-                        )
-                    }
-                    IconButton(onClick = onRefreshClients) {
-                        Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = "Refresh status"
-                        )
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background
+                    },
+                    actions = {
+                        IconButton(onClick = {
+                            showUpdateDialog = true
+                            if (updateResult == null && !isCheckingUpdate) {
+                                isCheckingUpdate = true
+                                coroutineScope.launch {
+                                    updateResult = GitHubUpdateChecker.checkForUpdate(
+                                        owner = repoOwnerInput,
+                                        repo = repoNameInput,
+                                        token = repoTokenInput.ifEmpty { null }
+                                    )
+                                    isCheckingUpdate = false
+                                }
+                            }
+                        }) {
+                            Icon(
+                                imageVector = Icons.Default.CloudDownload,
+                                contentDescription = "Check for updates from GitHub"
+                            )
+                        }
+                        if (selectedMode == AppMode.HOST) {
+                            IconButton(onClick = onRefreshClients) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Refresh status"
+                                )
+                            }
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.background
+                    )
                 )
-            )
+
+                TabRow(
+                    selectedTabIndex = selectedMode.ordinal,
+                    containerColor = MaterialTheme.colorScheme.background,
+                    contentColor = Sky400,
+                    divider = {
+                        HorizontalDivider(
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f)
+                        )
+                    }
+                ) {
+                    Tab(
+                        selected = selectedMode == AppMode.HOST,
+                        onClick = { selectedMode = AppMode.HOST },
+                        text = {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.WifiTethering,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp),
+                                    tint = if (selectedMode == AppMode.HOST) Sky400 else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = "Host (Phone 1)",
+                                    fontWeight = if (selectedMode == AppMode.HOST) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (selectedMode == AppMode.HOST) Sky400 else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    )
+                    Tab(
+                        selected = selectedMode == AppMode.CLIENT,
+                        onClick = { selectedMode = AppMode.CLIENT },
+                        text = {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.VpnKey,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp),
+                                    tint = if (selectedMode == AppMode.CLIENT) Emerald400 else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = "Client (Phone 2)",
+                                    fontWeight = if (selectedMode == AppMode.CLIENT) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (selectedMode == AppMode.CLIENT) Emerald400 else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    )
+                }
+            }
         }
     ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
+        when (selectedMode) {
+            AppMode.HOST -> {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
             // 1. Primary Hotspot Status & Control Card
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1014,6 +1097,21 @@ fun HotspotScreen(
             }
 
             Spacer(modifier = Modifier.height(20.dp))
+        }
+            }
+            AppMode.CLIENT -> {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
+                ) {
+                    ClientScreen(
+                        state = clientState,
+                        onToggleClient = onToggleClient,
+                        onClearLogs = onClearClientLogs
+                    )
+                }
+            }
         }
     }
 }
