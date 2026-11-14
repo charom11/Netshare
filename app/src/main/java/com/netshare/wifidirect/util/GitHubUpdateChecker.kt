@@ -8,7 +8,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.BufferedReader
-import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -28,7 +27,8 @@ object GitHubUpdateChecker {
 
     suspend fun checkForUpdate(
         owner: String = repositoryOwner,
-        repo: String = repositoryName
+        repo: String = repositoryName,
+        token: String? = null
     ): Result<GitHubReleaseInfo> = withContext(Dispatchers.IO) {
         try {
             val endpoint = "https://api.github.com/repos/$owner/$repo/releases/latest"
@@ -39,11 +39,20 @@ object GitHubUpdateChecker {
                 requestMethod = "GET"
                 setRequestProperty("Accept", "application/vnd.github.v3+json")
                 setRequestProperty("User-Agent", "NetShareDirect-Android")
+                if (!token.isNullOrBlank()) {
+                    setRequestProperty("Authorization", "Bearer ${token.trim()}")
+                }
             }
 
-            if (conn.responseCode != 200) {
+            val code = conn.responseCode
+            if (code == 404) {
                 return@withContext Result.failure(
-                    Exception("GitHub returned HTTP ${conn.responseCode} (${conn.responseMessage})")
+                    Exception("Repository is private or no releases published yet. If private, make it Public on GitHub or provide a token.")
+                )
+            }
+            if (code != 200) {
+                return@withContext Result.failure(
+                    Exception("GitHub returned HTTP $code (${conn.responseMessage})")
                 )
             }
 
@@ -54,17 +63,22 @@ object GitHubUpdateChecker {
             val body = json.optString("body", "No release notes provided.")
 
             // Look for .apk asset
-            var apkDownloadUrl = json.optString("html_url", "")
+            var apkDownloadUrl = ""
             val assets = json.optJSONArray("assets")
             if (assets != null) {
                 for (i in 0 until assets.length()) {
                     val asset = assets.getJSONObject(i)
                     val name = asset.optString("name", "")
                     if (name.endsWith(".apk", ignoreCase = true)) {
-                        apkDownloadUrl = asset.optString("browser_download_url", apkDownloadUrl)
+                        apkDownloadUrl = asset.optString("browser_download_url", "")
                         break
                     }
                 }
+            }
+
+            // Fallback to direct repository APK if asset was not attached to release
+            if (apkDownloadUrl.isEmpty()) {
+                apkDownloadUrl = "https://github.com/$owner/$repo/raw/main/NetShareDirect.apk"
             }
 
             val currentVersion = BuildConfig.VERSION_NAME

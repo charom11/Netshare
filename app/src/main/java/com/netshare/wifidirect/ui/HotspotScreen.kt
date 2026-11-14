@@ -124,6 +124,7 @@ fun HotspotScreen(
     var updateResult by remember { mutableStateOf<Result<GitHubReleaseInfo>?>(null) }
     var repoOwnerInput by rememberSaveable { mutableStateOf(GitHubUpdateChecker.repositoryOwner) }
     var repoNameInput by rememberSaveable { mutableStateOf(GitHubUpdateChecker.repositoryName) }
+    var repoTokenInput by rememberSaveable { mutableStateOf("") }
 
     val isRunning = state.status == HotspotStatus.RUNNING
     val isBusy = state.status == HotspotStatus.STARTING || state.status == HotspotStatus.STOPPING
@@ -183,6 +184,15 @@ fun HotspotScreen(
                         )
                     }
 
+                    OutlinedTextField(
+                        value = repoTokenInput,
+                        onValueChange = { repoTokenInput = it.trim() },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("GitHub Token (Only if repo is Private)") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true
+                    )
+
                     if (isCheckingUpdate) {
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
@@ -218,11 +228,22 @@ fun HotspotScreen(
                                 )
                             }
                         } else {
-                            Text(
-                                text = "Could not check updates: ${res.exceptionOrNull()?.message}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Rose500
-                            )
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    text = "Status: ${res.exceptionOrNull()?.message}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Rose500
+                                )
+                                OutlinedButton(
+                                    onClick = {
+                                        val rawUrl = "https://github.com/$repoOwnerInput/$repoNameInput/raw/main/NetShareDirect.apk"
+                                        GitHubUpdateChecker.openDownload(context, rawUrl)
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Download NetShareDirect.apk directly")
+                                }
+                            }
                         }
                     }
                 }
@@ -247,7 +268,11 @@ fun HotspotScreen(
                             isCheckingUpdate = true
                             updateResult = null
                             coroutineScope.launch {
-                                updateResult = GitHubUpdateChecker.checkForUpdate(repoOwnerInput, repoNameInput)
+                                updateResult = GitHubUpdateChecker.checkForUpdate(
+                                    owner = repoOwnerInput,
+                                    repo = repoNameInput,
+                                    token = repoTokenInput.ifEmpty { null }
+                                )
                                 isCheckingUpdate = false
                             }
                         },
@@ -298,7 +323,11 @@ fun HotspotScreen(
                         if (updateResult == null && !isCheckingUpdate) {
                             isCheckingUpdate = true
                             coroutineScope.launch {
-                                updateResult = GitHubUpdateChecker.checkForUpdate(repoOwnerInput, repoNameInput)
+                                updateResult = GitHubUpdateChecker.checkForUpdate(
+                                    owner = repoOwnerInput,
+                                    repo = repoNameInput,
+                                    token = repoTokenInput.ifEmpty { null }
+                                )
                                 isCheckingUpdate = false
                             }
                         }
