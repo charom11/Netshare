@@ -86,10 +86,26 @@ class UpstreamNetworkTracker(context: Context) {
     }
 
     private fun refreshNetworkState(candidate: Network) {
-        // Prefer the system's active default network if available
-        val defaultNet = connectivityManager.activeNetwork ?: candidate
-        val caps = connectivityManager.getNetworkCapabilities(defaultNet)
-        val linkProps = connectivityManager.getLinkProperties(defaultNet)
+        var chosenNet = connectivityManager.activeNetwork ?: candidate
+        var caps = connectivityManager.getNetworkCapabilities(chosenNet)
+        var linkProps = connectivityManager.getLinkProperties(chosenNet)
+
+        val iface = linkProps?.interfaceName ?: "unknown"
+        if (iface.startsWith("p2p") || caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+            val internetNet = connectivityManager.allNetworks.firstOrNull { net ->
+                val c = connectivityManager.getNetworkCapabilities(net) ?: return@firstOrNull false
+                val lp = connectivityManager.getLinkProperties(net) ?: return@firstOrNull false
+                val name = lp.interfaceName ?: ""
+                !name.startsWith("p2p") &&
+                    c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    (c.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) || c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI))
+            }
+            if (internetNet != null) {
+                chosenNet = internetNet
+                caps = connectivityManager.getNetworkCapabilities(chosenNet)
+                linkProps = connectivityManager.getLinkProperties(chosenNet)
+            }
+        }
 
         if (caps == null || linkProps == null) {
             activeNetwork = null
@@ -97,17 +113,12 @@ class UpstreamNetworkTracker(context: Context) {
             return
         }
 
-        val iface = linkProps.interfaceName ?: "unknown"
-        // Ignore the P2P interface itself when looking for upstream internet
-        if (iface.startsWith("p2p")) {
-            return
-        }
-
+        val resolvedIface = linkProps.interfaceName ?: "unknown"
         val transport = when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi ($iface)"
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "Mobile Data ($iface)"
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet ($iface)"
-            else -> "Network ($iface)"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi ($resolvedIface)"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "Mobile Data ($resolvedIface)"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet ($resolvedIface)"
+            else -> "Network ($resolvedIface)"
         }
 
         val ipv4 = linkProps.linkAddresses
@@ -121,9 +132,9 @@ class UpstreamNetworkTracker(context: Context) {
             .mapNotNull { it.hostAddress }
             .ifEmpty { listOf("8.8.8.8", "1.1.1.1") }
 
-        activeNetwork = defaultNet
+        activeNetwork = chosenNet
         _upstreamInfo.value = UpstreamNetworkInfo(
-            interfaceName = iface,
+            interfaceName = resolvedIface,
             transportType = transport,
             ipv4Address = ipv4,
             dnsServers = dnsList,

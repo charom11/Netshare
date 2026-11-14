@@ -17,19 +17,22 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Pure Kotlin Userspace Tunnel that intercepts raw packets from the VPN TUN interface
  * and bridges them to the NetShare Direct Gateway at 192.168.49.1:8282.
  *
- * Key fixes for "Connected but no internet":
- * 1. DNS queries go DIRECTLY to 8.8.8.8 (or 1.1.1.1 fallback) via a protected UDP socket,
- *    bypassing the gateway entirely — the Host phone's DNS Forwarder may be on port 5353
- *    (not 53) when non-root, so sending to gateway:53 would fail silently.
- * 2. TCP response data from the proxy is segmented to fit inside TUN MTU (max ~1400 bytes
- *    per IP packet), preventing silent drops of oversized packets.
- * 3. Better error logging and connection retry logic.
+ * Core Fixes:
+ * 1. Payload Queuing: Data packets (TLS Client Hello, HTTP GET) arriving before the upstream
+ *    HTTP CONNECT handshake completes are buffered in [TcpSession.pendingPayloads] and flushed
+ *    in exact FIFO order as soon as the tunnel connects. No dropped requests!
+ * 2. Multi-Path DNS: Resolves queries using:
+ *    - UDP to Phone 1's local forwarder on ports 8253, 5353, 53.
+ *    - DNS-over-TCP via HTTP CONNECT through the gateway (:8282) to 8.8.8.8:53 & 1.1.1.1:53.
+ *    - In-memory DNS cache for instant sub-millisecond repeat resolutions.
+ * 3. MTU-safe packet segmentation: All TCP return traffic is split into MTU-safe chunks (max 1400 bytes).
  */
 class TunToProxyEngine(
     private val tunFd: FileDescriptor,
@@ -49,11 +52,8 @@ class TunToProxyEngine(
     val totalTxBytes = AtomicLong(0L)
 
     private val tcpConnections = ConcurrentHashMap<String, TcpSession>()
+    private val dnsCache = ConcurrentHashMap<String, ByteArray>()
 
-    // DNS servers to query directly (bypassing the gateway)
-    private val dnsServers = listOf("8.8.8.8", "1.1.1.1")
-
-    // Max TCP payload per TUN write to avoid exceeding MTU
     private val maxTcpSegmentPayload = 1400
 
     private class TcpSession(
@@ -64,15 +64,17 @@ class TunToProxyEngine(
         val dstPort: Int,
         var clientSeq: Long,
         var serverSeq: Long,
-        var socket: Socket? = null,
-        var socketOut: OutputStream? = null,
-        var isEstablished: Boolean = false,
-        var isClosed: Boolean = false
-    )
+        @Volatile var socket: Socket? = null,
+        @Volatile var socketOut: OutputStream? = null,
+        @Volatile var isEstablished: Boolean = false,
+        @Volatile var isClosed: Boolean = false
+    ) {
+        val pendingPayloads = ConcurrentLinkedQueue<ByteArray>()
+    }
 
     fun start() {
         stop()
-        onLog("TUN Engine started → Gateway $gatewayHost:$gatewayPort | DNS direct to ${dnsServers[0]}")
+        onLog("TUN-to-Proxy active → Gateway $gatewayHost:$gatewayPort (DNS: local + TCP tunnel)")
 
         engineJob = scope.launch {
             val buffer = ByteArray(32768)
@@ -84,7 +86,7 @@ class TunToProxyEngine(
                     totalRxBytes.addAndGet(readLen.toLong())
                     val ipPacket = PacketUtils.parseIp(buffer, readLen) ?: continue
 
-                    // Skip traffic destined to the gateway proxy port itself (avoid loop)
+                    // Ignore loopback or direct traffic destined to the gateway host on gatewayPort
                     if (ipPacket.dstIp == gatewayHost && ipPacket.ipPayloadOffset + 4 <= readLen) {
                         val dstPort = ((buffer[ipPacket.ipPayloadOffset + 2].toInt() and 0xFF) shl 8) or
                             (buffer[ipPacket.ipPayloadOffset + 3].toInt() and 0xFF)
@@ -102,16 +104,14 @@ class TunToProxyEngine(
                         PacketUtils.PROTOCOL_UDP -> {
                             val udpPacket = PacketUtils.parseUdp(buffer, ipPacket) ?: continue
                             if (udpPacket.dstPort == 53) {
-                                // DNS — forward directly to public DNS via protected socket
                                 val dnsQuery = buffer.copyOfRange(
                                     udpPacket.payloadOffset,
                                     udpPacket.payloadOffset + udpPacket.payloadLength
                                 )
                                 launch {
-                                    forwardDnsDirect(ipPacket, udpPacket, dnsQuery)
+                                    resolveAndReplyDns(ipPacket, udpPacket, dnsQuery)
                                 }
                             }
-                            // Other UDP: silently drop (VPN tunnel only handles TCP + DNS)
                         }
 
                         PacketUtils.PROTOCOL_TCP -> {
@@ -133,7 +133,7 @@ class TunToProxyEngine(
     ) {
         val key = "${tcp.srcPort}:${ip.dstIp}:${tcp.dstPort}"
 
-        // 1. SYN — new connection
+        // 1. SYN — connection initiation
         if ((tcp.flags and PacketUtils.TCP_FLAG_SYN) != 0 && (tcp.flags and PacketUtils.TCP_FLAG_ACK) == 0) {
             val initialServerSeq = (Math.random() * 1000000).toLong()
             val session = TcpSession(
@@ -147,7 +147,7 @@ class TunToProxyEngine(
             )
             tcpConnections[key] = session
 
-            // SYN-ACK back immediately
+            // Reply with SYN-ACK immediately so client OS considers connection OPEN
             val synAck = PacketUtils.buildTcpPacket(
                 srcIp = ip.dstIpBytes,
                 dstIp = ip.srcIpBytes,
@@ -160,7 +160,7 @@ class TunToProxyEngine(
             session.serverSeq = (session.serverSeq + 1) and 0xFFFFFFFFL
             sendToTun(synAck)
 
-            // Connect upstream via HTTP CONNECT
+            // Connect upstream to proxy in background
             scope.launch {
                 initiateProxyConnection(session, ip.dstIp, tcp.dstPort)
             }
@@ -175,10 +175,11 @@ class TunToProxyEngine(
             return
         }
 
-        // 3. Data payload — forward to gateway
+        // 3. Data payload — ACK and queue for transmission
         if (tcp.payloadLength > 0) {
             session.clientSeq = (tcp.seqNumber + tcp.payloadLength) and 0xFFFFFFFFL
 
+            // ACK the data packet back to TUN so client TCP stack knows it arrived
             val ackPacket = PacketUtils.buildTcpPacket(
                 srcIp = session.dstIpBytes,
                 dstIp = session.srcIpBytes,
@@ -191,13 +192,28 @@ class TunToProxyEngine(
             sendToTun(ackPacket)
 
             val payload = rawPacket.copyOfRange(tcp.payloadOffset, tcp.payloadOffset + tcp.payloadLength)
-            scope.launch {
-                try {
-                    session.socketOut?.write(payload)
-                    session.socketOut?.flush()
-                } catch (_: Exception) {
-                    closeSession(session, sendFin = true)
+            session.pendingPayloads.add(payload)
+
+            // Flush queue if socket is already connected
+            flushSessionPayloads(session)
+        }
+    }
+
+    private fun flushSessionPayloads(session: TcpSession) {
+        if (!session.isEstablished || session.isClosed) return
+        val out = session.socketOut ?: return
+
+        scope.launch {
+            try {
+                synchronized(out) {
+                    while (true) {
+                        val chunk = session.pendingPayloads.poll() ?: break
+                        out.write(chunk)
+                    }
+                    out.flush()
                 }
+            } catch (_: Exception) {
+                closeSession(session, sendFin = true)
             }
         }
     }
@@ -206,33 +222,35 @@ class TunToProxyEngine(
         try {
             val socket = Socket()
             socket.tcpNoDelay = true
-            socket.soTimeout = 30_000
+            socket.keepAlive = true
+            socket.soTimeout = 45_000
             socket.sendBufferSize = 65536
             socket.receiveBufferSize = 65536
+
             if (!protectSocket(socket)) {
-                onLog("WARN: Failed to protect proxy socket for $targetHost:$targetPort")
+                onLog("WARN: Socket protect returned false for $targetHost:$targetPort")
             }
 
-            socket.connect(InetSocketAddress(gatewayHost, gatewayPort), 10_000)
+            socket.connect(InetSocketAddress(gatewayHost, gatewayPort), 8000)
             session.socket = socket
 
             val out = socket.getOutputStream()
             val input = socket.getInputStream()
             session.socketOut = out
 
-            // HTTP CONNECT handshake
+            // Send HTTP CONNECT to NetShare Gateway
             val connectReq = "CONNECT $targetHost:$targetPort HTTP/1.1\r\nHost: $targetHost:$targetPort\r\n\r\n"
             out.write(connectReq.toByteArray(Charsets.ISO_8859_1))
             out.flush()
 
-            // Read response
+            // Read HTTP 200 response line
             val respLine = readLine(input)
             if (respLine == null || !respLine.contains("200")) {
-                onLog("CONNECT rejected for $targetHost:$targetPort → $respLine")
                 closeSession(session, sendFin = true)
                 return
             }
-            // Consume remaining headers until blank line
+
+            // Consume remaining headers until empty line
             while (true) {
                 val line = readLine(input)
                 if (line.isNullOrEmpty()) break
@@ -240,13 +258,15 @@ class TunToProxyEngine(
 
             session.isEstablished = true
 
-            // Read upstream data and inject back into TUN as segmented TCP packets
+            // Immediately flush any payloads buffered while CONNECT was in progress
+            flushSessionPayloads(session)
+
+            // Read data from upstream server and inject into TUN in MTU-safe segments
             val buf = ByteArray(32768)
             while (!session.isClosed && socket.isConnected && !socket.isClosed) {
                 val n = input.read(buf)
                 if (n <= 0) break
 
-                // Segment the response into MTU-safe chunks
                 var offset = 0
                 while (offset < n && !session.isClosed) {
                     val chunkSize = minOf(maxTcpSegmentPayload, n - offset)
@@ -267,54 +287,159 @@ class TunToProxyEngine(
                     offset += chunkSize
                 }
             }
-        } catch (e: Exception) {
-            onLog("Proxy connection error for ${session.key}: ${e.message}")
+        } catch (_: Exception) {
         } finally {
             closeSession(session, sendFin = true)
         }
     }
 
     /**
-     * Forward DNS queries DIRECTLY to public DNS servers (8.8.8.8, 1.1.1.1)
-     * via a VPN-protected UDP socket. This completely bypasses the gateway,
-     * solving the problem where Phone 1's DNS forwarder binds to port 5353
-     * (unreachable on port 53 without root iptables redirect).
+     * Multi-Path DNS Resolver:
+     * 1. Check in-memory cache.
+     * 2. Try UDP to Phone 1 local DNS Forwarder (ports 8253, 5353, 53).
+     * 3. Fallback to DNS-over-TCP via HTTP CONNECT through Gateway (:8282).
      */
-    private fun forwardDnsDirect(
+    private suspend fun resolveAndReplyDns(
         ip: PacketUtils.ParsedIpPacket,
         udp: PacketUtils.ParsedUdpPacket,
         dnsQuery: ByteArray
     ) {
-        for (dnsServer in dnsServers) {
-            var udpSocket: DatagramSocket? = null
-            try {
-                udpSocket = DatagramSocket()
-                udpSocket.soTimeout = 3000
-                protectDatagram(udpSocket)
+        if (dnsQuery.size < 12) return
 
-                val targetDns = InetAddress.getByName(dnsServer)
-                val outPacket = DatagramPacket(dnsQuery, dnsQuery.size, targetDns, 53)
-                udpSocket.send(outPacket)
+        // Cache key based on query payload (ignoring 2-byte transaction ID)
+        val querySignature = dnsQuery.copyOfRange(2, dnsQuery.size).contentHashCode().toString()
+        val transactionId = dnsQuery.copyOfRange(0, 2)
 
-                val recvBuf = ByteArray(1500)
-                val inPacket = DatagramPacket(recvBuf, recvBuf.size)
-                udpSocket.receive(inPacket)
+        val cachedAnswer = dnsCache[querySignature]
+        if (cachedAnswer != null && cachedAnswer.size >= 12) {
+            val reply = cachedAnswer.clone()
+            reply[0] = transactionId[0]
+            reply[1] = transactionId[1]
+            val replyPacket = PacketUtils.buildUdpPacket(
+                srcIp = ip.dstIpBytes,
+                dstIp = ip.srcIpBytes,
+                srcPort = udp.dstPort,
+                dstPort = udp.srcPort,
+                payload = reply
+            )
+            sendToTun(replyPacket)
+            return
+        }
 
-                val replyDns = inPacket.data.copyOf(inPacket.length)
-                val replyIpPacket = PacketUtils.buildUdpPacket(
+        // Path A: Try UDP to Phone 1 local forwarder ports (8253, 5353, 53)
+        val localPorts = intArrayOf(8253, 5353, 53)
+        for (port in localPorts) {
+            val reply = queryDnsUdp(gatewayHost, port, dnsQuery)
+            if (reply != null) {
+                dnsCache[querySignature] = reply
+                val replyPacket = PacketUtils.buildUdpPacket(
                     srcIp = ip.dstIpBytes,
                     dstIp = ip.srcIpBytes,
                     srcPort = udp.dstPort,
                     dstPort = udp.srcPort,
-                    payload = replyDns
+                    payload = reply
                 )
-                sendToTun(replyIpPacket)
-                return // Success, don't try fallback
-            } catch (_: Exception) {
-                // Try next DNS server
-            } finally {
-                try { udpSocket?.close() } catch (_: Exception) {}
+                sendToTun(replyPacket)
+                return
             }
+        }
+
+        // Path B: Fallback to DNS-over-TCP via HTTP CONNECT through the Gateway (:8282)
+        val publicDnsServers = listOf("8.8.8.8", "1.1.1.1")
+        for (dnsIp in publicDnsServers) {
+            val reply = queryDnsOverTcpThroughProxy(dnsIp, 53, dnsQuery)
+            if (reply != null) {
+                dnsCache[querySignature] = reply
+                val replyPacket = PacketUtils.buildUdpPacket(
+                    srcIp = ip.dstIpBytes,
+                    dstIp = ip.srcIpBytes,
+                    srcPort = udp.dstPort,
+                    dstPort = udp.srcPort,
+                    payload = reply
+                )
+                sendToTun(replyPacket)
+                return
+            }
+        }
+    }
+
+    private fun queryDnsUdp(host: String, port: Int, query: ByteArray): ByteArray? {
+        var sock: DatagramSocket? = null
+        return try {
+            sock = DatagramSocket()
+            sock.soTimeout = 1200
+            protectDatagram(sock)
+
+            val dest = InetAddress.getByName(host)
+            val packet = DatagramPacket(query, query.size, dest, port)
+            sock.send(packet)
+
+            val buf = ByteArray(2048)
+            val resp = DatagramPacket(buf, buf.size)
+            sock.receive(resp)
+            buf.copyOf(resp.length)
+        } catch (_: Exception) {
+            null
+        } finally {
+            try { sock?.close() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Queries public DNS (8.8.8.8:53) over TCP tunnel through the gateway.
+     * RFC 1035 TCP DNS format: 2-byte big-endian length prefix followed by query.
+     */
+    private fun queryDnsOverTcpThroughProxy(dnsHost: String, dnsPort: Int, query: ByteArray): ByteArray? {
+        var socket: Socket? = null
+        return try {
+            socket = Socket()
+            socket.tcpNoDelay = true
+            socket.soTimeout = 3000
+            protectSocket(socket)
+
+            socket.connect(InetSocketAddress(gatewayHost, gatewayPort), 2500)
+            val out = socket.getOutputStream()
+            val input = socket.getInputStream()
+
+            // CONNECT handshake
+            val req = "CONNECT $dnsHost:$dnsPort HTTP/1.1\r\nHost: $dnsHost:$dnsPort\r\n\r\n"
+            out.write(req.toByteArray(Charsets.ISO_8859_1))
+            out.flush()
+
+            val resp = readLine(input)
+            if (resp == null || !resp.contains("200")) return null
+
+            while (true) {
+                val line = readLine(input)
+                if (line.isNullOrEmpty()) break
+            }
+
+            // Write 2-byte length prefix + query
+            val qLen = query.size
+            out.write(byteArrayOf((qLen shr 8).toByte(), (qLen and 0xFF).toByte()))
+            out.write(query)
+            out.flush()
+
+            // Read 2-byte response length
+            val b1 = input.read()
+            val b2 = input.read()
+            if (b1 == -1 || b2 == -1) return null
+            val respLen = ((b1 and 0xFF) shl 8) or (b2 and 0xFF)
+            if (respLen <= 0 || respLen > 4096) return null
+
+            // Read response bytes
+            val answer = ByteArray(respLen)
+            var readTotal = 0
+            while (readTotal < respLen) {
+                val n = input.read(answer, readTotal, respLen - readTotal)
+                if (n == -1) break
+                readTotal += n
+            }
+            if (readTotal == respLen) answer else null
+        } catch (_: Exception) {
+            null
+        } finally {
+            try { socket?.close() } catch (_: Exception) {}
         }
     }
 
@@ -366,6 +491,7 @@ class TunToProxyEngine(
         engineJob = null
         tcpConnections.values.forEach { closeSession(it, sendFin = false) }
         tcpConnections.clear()
+        dnsCache.clear()
         try { tunIn.close() } catch (_: Exception) {}
         try { tunOut.close() } catch (_: Exception) {}
     }

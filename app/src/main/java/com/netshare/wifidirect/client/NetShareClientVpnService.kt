@@ -80,6 +80,7 @@ class NetShareClientVpnService : VpnService() {
             val builder = Builder()
                 .addAddress("10.254.1.2", 24)
                 .addRoute("0.0.0.0", 0)
+                .addDnsServer(host)
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
                 .setMtu(1500)

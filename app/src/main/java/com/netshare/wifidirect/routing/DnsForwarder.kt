@@ -13,9 +13,8 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 
 /**
- * Lightweight UDP DNS Forwarder bound to the Wi-Fi Direct Group Owner IP (192.168.49.1).
- * Forwards DNS queries from connected Wi-Fi Direct clients directly through the active
- * upstream Android [Network] using [Network.bindSocket].
+ * Robust UDP DNS Forwarder bound to 0.0.0.0 on fallback ports (8253, 5353) and privileged port 53 (if root).
+ * Forwards queries from connected Wi-Fi Direct clients to upstream DNS servers (active Network or 8.8.8.8 / 1.1.1.1).
  */
 class DnsForwarder(
     private val onLog: (String) -> Unit
@@ -23,9 +22,10 @@ class DnsForwarder(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var serverJob: Job? = null
     private var listenSocket: DatagramSocket? = null
+    private var auxSocket: DatagramSocket? = null
 
     @Volatile
-    var boundPort: Int = FALLBACK_DNS_PORT
+    var boundPort: Int = PRIMARY_UNPRIVILEGED_DNS_PORT
         private set
 
     fun start(
@@ -35,59 +35,98 @@ class DnsForwarder(
     ): Int {
         stop()
 
-        val socket = try {
-            // Try binding directly to port 53 if running with root/CAP_NET_BIND_SERVICE
+        // 1. Try privileged port 53 (if rooted)
+        var primarySocket: DatagramSocket? = try {
             DatagramSocket(null).apply {
                 reuseAddress = true
-                bind(InetSocketAddress(InetAddress.getByName(groupOwnerIp), PRIVILEGED_DNS_PORT))
+                bind(InetSocketAddress("0.0.0.0", PRIVILEGED_DNS_PORT))
             }.also {
                 boundPort = PRIVILEGED_DNS_PORT
-                onLog("DNS forwarder bound to $groupOwnerIp:$PRIVILEGED_DNS_PORT")
+                onLog("DNS forwarder active on port $PRIVILEGED_DNS_PORT (Root / Privileged)")
             }
         } catch (_: Exception) {
-            // Bind to unprivileged port 5353 (iptables PREROUTING redirects 53 -> 5353)
-            try {
+            null
+        }
+
+        // 2. If port 53 not available, bind to PRIMARY_UNPRIVILEGED_DNS_PORT (8253)
+        if (primarySocket == null) {
+            primarySocket = try {
                 DatagramSocket(null).apply {
                     reuseAddress = true
-                    bind(InetSocketAddress(InetAddress.getByName(groupOwnerIp), FALLBACK_DNS_PORT))
+                    bind(InetSocketAddress("0.0.0.0", PRIMARY_UNPRIVILEGED_DNS_PORT))
                 }.also {
-                    boundPort = FALLBACK_DNS_PORT
-                    onLog("DNS forwarder bound to $groupOwnerIp:$FALLBACK_DNS_PORT (upstream $upstreamDnsServer)")
+                    boundPort = PRIMARY_UNPRIVILEGED_DNS_PORT
+                    onLog("DNS forwarder listening on UDP port $PRIMARY_UNPRIVILEGED_DNS_PORT & $FALLBACK_DNS_PORT")
                 }
             } catch (e: Exception) {
-                onLog("DNS forwarder bind skipped: ${e.message}")
-                return -1
+                onLog("DNS forwarder port $PRIMARY_UNPRIVILEGED_DNS_PORT bind failed: ${e.message}")
+                null
             }
         }
 
-        listenSocket = socket
-        serverJob = scope.launch {
-            val buffer = ByteArray(1500)
-            while (isActive && !socket.isClosed) {
-                try {
-                    val requestPacket = DatagramPacket(buffer, buffer.size)
-                    socket.receive(requestPacket)
+        // 3. Also try to bind auxSocket on port 5353 as secondary listener
+        try {
+            auxSocket = DatagramSocket(null).apply {
+                reuseAddress = true
+                bind(InetSocketAddress("0.0.0.0", FALLBACK_DNS_PORT))
+            }
+        } catch (_: Exception) {
+            auxSocket = null
+        }
 
-                    val queryBytes = requestPacket.data.copyOfRange(0, requestPacket.length)
-                    val clientAddress = requestPacket.address
-                    val clientPort = requestPacket.port
+        if (primarySocket == null && auxSocket == null) {
+            onLog("DNS forwarder could not bind any listening port")
+            return -1
+        }
 
-                    launch {
-                        forwardDnsQuery(
-                            listenSocket = socket,
-                            queryBytes = queryBytes,
-                            clientAddress = clientAddress,
-                            clientPort = clientPort,
-                            upstreamDnsServer = upstreamDnsServer,
-                            upstreamNetwork = upstreamNetworkProvider()
-                        )
-                    }
-                } catch (_: Exception) {
-                    if (socket.isClosed) break
-                }
+        listenSocket = primarySocket
+
+        // Start listener loop for primarySocket
+        primarySocket?.let { sock ->
+            serverJob = scope.launch {
+                startListenerLoop(sock, upstreamDnsServer, upstreamNetworkProvider)
             }
         }
+
+        // Start listener loop for auxSocket
+        auxSocket?.let { sock ->
+            scope.launch {
+                startListenerLoop(sock, upstreamDnsServer, upstreamNetworkProvider)
+            }
+        }
+
         return boundPort
+    }
+
+    private suspend fun startListenerLoop(
+        sock: DatagramSocket,
+        upstreamDnsServer: String,
+        upstreamNetworkProvider: () -> Network?
+    ) {
+        val buffer = ByteArray(2048)
+        while (scope.isActive && !sock.isClosed) {
+            try {
+                val packet = DatagramPacket(buffer, buffer.size)
+                sock.receive(packet)
+
+                val queryBytes = packet.data.copyOfRange(0, packet.length)
+                val clientAddress = packet.address
+                val clientPort = packet.port
+
+                scope.launch {
+                    forwardDnsQuery(
+                        listenSocket = sock,
+                        queryBytes = queryBytes,
+                        clientAddress = clientAddress,
+                        clientPort = clientPort,
+                        upstreamDnsServer = upstreamDnsServer,
+                        upstreamNetwork = upstreamNetworkProvider()
+                    )
+                }
+            } catch (_: Exception) {
+                if (sock.isClosed) break
+            }
+        }
     }
 
     private fun forwardDnsQuery(
@@ -98,33 +137,48 @@ class DnsForwarder(
         upstreamDnsServer: String,
         upstreamNetwork: Network?
     ) {
-        var upstreamSocket: DatagramSocket? = null
-        try {
-            upstreamSocket = DatagramSocket()
-            upstreamSocket.soTimeout = 3500
-            // Bind the UDP socket directly to the active upstream network (Wi-Fi or Mobile Data)
-            upstreamNetwork?.bindSocket(upstreamSocket)
+        val upstreamList = listOf(upstreamDnsServer, "8.8.8.8", "1.1.1.1").distinct()
 
-            val dnsAddr = InetAddress.getByName(upstreamDnsServer)
-            val outPacket = DatagramPacket(queryBytes, queryBytes.size, dnsAddr, PRIVILEGED_DNS_PORT)
-            upstreamSocket.send(outPacket)
+        for (targetServer in upstreamList) {
+            var upstreamSocket: DatagramSocket? = null
+            try {
+                upstreamSocket = DatagramSocket()
+                upstreamSocket.soTimeout = 2500
 
-            val respBuf = ByteArray(1500)
-            val respPacket = DatagramPacket(respBuf, respBuf.size)
-            upstreamSocket.receive(respPacket)
+                // Attempt to bind socket to upstream network if available
+                if (upstreamNetwork != null) {
+                    try {
+                        upstreamNetwork.bindSocket(upstreamSocket)
+                    } catch (_: Exception) {
+                    }
+                }
 
-            val replyPacket = DatagramPacket(
-                respPacket.data,
-                respPacket.length,
-                clientAddress,
-                clientPort
-            )
-            if (!listenSocket.isClosed) {
-                listenSocket.send(replyPacket)
+                val dnsAddr = InetAddress.getByName(targetServer)
+                val outPacket = DatagramPacket(queryBytes, queryBytes.size, dnsAddr, PRIVILEGED_DNS_PORT)
+                upstreamSocket.send(outPacket)
+
+                val respBuf = ByteArray(2048)
+                val respPacket = DatagramPacket(respBuf, respBuf.size)
+                upstreamSocket.receive(respPacket)
+
+                val replyPacket = DatagramPacket(
+                    respPacket.data,
+                    respPacket.length,
+                    clientAddress,
+                    clientPort
+                )
+                if (!listenSocket.isClosed) {
+                    listenSocket.send(replyPacket)
+                }
+                return // Success!
+            } catch (_: Exception) {
+                // Try next upstream server
+            } finally {
+                try {
+                    upstreamSocket?.close()
+                } catch (_: Exception) {
+                }
             }
-        } catch (_: Exception) {
-        } finally {
-            upstreamSocket?.close()
         }
     }
 
@@ -136,11 +190,17 @@ class DnsForwarder(
         } catch (_: Exception) {
         }
         listenSocket = null
+
+        try {
+            auxSocket?.close()
+        } catch (_: Exception) {
+        }
+        auxSocket = null
     }
 
     companion object {
         const val PRIVILEGED_DNS_PORT = 53
+        const val PRIMARY_UNPRIVILEGED_DNS_PORT = 8253
         const val FALLBACK_DNS_PORT = 5353
     }
 }
-
