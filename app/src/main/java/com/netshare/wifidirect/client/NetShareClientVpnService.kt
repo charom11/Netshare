@@ -15,6 +15,7 @@ import com.netshare.wifidirect.MainActivity
 import com.netshare.wifidirect.R
 import com.netshare.wifidirect.model.TrafficMetrics
 import com.netshare.wifidirect.util.FormatUtils
+import hev.htproxy.TProxyService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,6 +27,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -34,7 +36,6 @@ class NetShareClientVpnService : VpnService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var proxyEngine: TunToProxyEngine? = null
     private var monitorJob: Job? = null
 
     override fun onCreate() {
@@ -67,7 +68,7 @@ class NetShareClientVpnService : VpnService() {
                 errorMessage = null
             )
         }
-        log("Establishing VPN Tunnel to $host:$port...")
+        log("Starting native SOCKS5 tunnel to $host:$port...")
 
         val notification = buildNotification("Connecting to NetShare Hotspot...", "Gateway: $host:$port")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -78,14 +79,18 @@ class NetShareClientVpnService : VpnService() {
 
         try {
             val builder = Builder()
+                .setBlocking(false)
+                .setMtu(1500)
                 .addAddress("10.254.1.2", 24)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer(host)
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
-                .setMtu(1500)
                 .setSession("NetShare Direct Client")
-                .setBlocking(true)
+
+            try {
+                builder.addDisallowedApplication(packageName)
+            } catch (_: Exception) {
+            }
 
             val openIntent = Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -102,16 +107,30 @@ class NetShareClientVpnService : VpnService() {
             }
 
             vpnInterface = pfd
-            val engine = TunToProxyEngine(
-                tunFd = pfd.fileDescriptor,
-                gatewayHost = host,
-                gatewayPort = port,
-                protectSocket = { socket -> protect(socket) },
-                protectDatagram = { datagram -> protect(datagram) },
-                onLog = ::log
-            )
-            proxyEngine = engine
-            engine.start()
+
+            // Generate tproxy.conf for hev-socks5-tunnel
+            val configFile = File(cacheDir, "tproxy.conf")
+            val confContent = """
+                misc:
+                  task-stack-size: 20480
+                tunnel:
+                  mtu: 1500
+                  icmp: 'reply'
+                socks5:
+                  port: $port
+                  address: '$host'
+                  udp: 'tcp'
+                mapdns:
+                  address: 8.8.8.8
+                  port: 53
+                  network: 240.0.0.0
+                  netmask: 240.0.0.0
+                  cache-size: 10000
+            """.trimIndent()
+            configFile.writeText(confContent)
+
+            // Start native hev-socks5-tunnel (lwIP C TCP/IP stack)
+            TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
 
             _clientState.update {
                 it.copy(
@@ -120,7 +139,7 @@ class NetShareClientVpnService : VpnService() {
                     errorMessage = null
                 )
             }
-            log("Client VPN connected! All phone traffic is now routing through $host:$port")
+            log("Native SOCKS5 Tunnel active! All device apps routing through $host:$port")
 
             startTrafficMonitor(host, port)
         } catch (e: Exception) {
@@ -138,12 +157,12 @@ class NetShareClientVpnService : VpnService() {
 
             while (isActive) {
                 delay(1000L)
-                val engine = proxyEngine ?: break
+                val stats = try { TProxyService.TProxyGetStats() } catch (_: Exception) { null }
                 val now = System.currentTimeMillis()
                 val elapsed = maxOf(1L, now - lastTime)
 
-                val curRx = engine.totalRxBytes.get()
-                val curTx = engine.totalTxBytes.get()
+                val curRx = stats?.getOrNull(0) ?: lastRx
+                val curTx = stats?.getOrNull(1) ?: lastTx
 
                 val downSpeed = ((curRx - lastRx) * 1000L) / elapsed
                 val upSpeed = ((curTx - lastTx) * 1000L) / elapsed
@@ -177,8 +196,10 @@ class NetShareClientVpnService : VpnService() {
         monitorJob?.cancel()
         monitorJob = null
 
-        proxyEngine?.stop()
-        proxyEngine = null
+        try {
+            TProxyService.TProxyStopService()
+        } catch (_: Exception) {
+        }
 
         try {
             vpnInterface?.close()
