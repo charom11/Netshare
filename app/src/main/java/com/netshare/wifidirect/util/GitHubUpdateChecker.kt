@@ -22,8 +22,8 @@ data class GitHubReleaseInfo(
 
 object GitHubUpdateChecker {
 
-    // Default repository (can be changed to user's github repo)
-    var repositoryOwner: String = "johnk"
+    // Default repository
+    var repositoryOwner: String = "charom11"
     var repositoryName: String = "Netshare"
 
     suspend fun checkForUpdate(
