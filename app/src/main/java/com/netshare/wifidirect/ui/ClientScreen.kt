@@ -76,7 +76,6 @@ fun ClientScreen(
     var showLogs by rememberSaveable { mutableStateOf(true) }
 
     val isConnected = state.status == ClientConnectionStatus.CONNECTED
-    val isConnecting = state.status == ClientConnectionStatus.CONNECTING
 
     Column(
         modifier = Modifier

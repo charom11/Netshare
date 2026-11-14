@@ -1,13 +1,21 @@
 package com.netshare.wifidirect.util
 
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.widget.Toast
+import androidx.core.content.FileProvider
 import com.netshare.wifidirect.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -24,6 +32,8 @@ object GitHubUpdateChecker {
     // Default repository
     var repositoryOwner: String = "charom11"
     var repositoryName: String = "Netshare"
+
+    private var activeDownloadId: Long = -1L
 
     suspend fun checkForUpdate(
         owner: String = repositoryOwner,
@@ -95,6 +105,112 @@ object GitHubUpdateChecker {
             )
         } catch (e: Exception) {
             Result.failure(e)
+        }
+    }
+
+    /**
+     * Downloads the APK using Android DownloadManager and auto-installs it when complete.
+     */
+    fun downloadAndInstall(context: Context, downloadUrl: String, versionTag: String) {
+        try {
+            val fileName = "NetShareDirect-v$versionTag.apk"
+
+            // Clean up old downloads
+            val downloadDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+            downloadDir?.listFiles()?.forEach { file ->
+                if (file.name.endsWith(".apk")) {
+                    file.delete()
+                }
+            }
+
+            val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            val uri = Uri.parse(downloadUrl)
+
+            val request = DownloadManager.Request(uri).apply {
+                setTitle("NetShare Direct Update v$versionTag")
+                setDescription("Downloading update...")
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setDestinationInExternalFilesDir(context, Environment.DIRECTORY_DOWNLOADS, fileName)
+                setMimeType("application/vnd.android.package-archive")
+                // Allow download over any network
+                setAllowedNetworkTypes(
+                    DownloadManager.Request.NETWORK_WIFI or DownloadManager.Request.NETWORK_MOBILE
+                )
+            }
+
+            activeDownloadId = dm.enqueue(request)
+            Toast.makeText(context, "Downloading update v$versionTag...", Toast.LENGTH_SHORT).show()
+
+            // Register receiver to auto-install when download completes
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(ctx: Context, intent: Intent) {
+                    val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+                    if (id != activeDownloadId) return
+
+                    try {
+                        ctx.unregisterReceiver(this)
+                    } catch (_: Exception) {}
+
+                    val downloadedFile = File(downloadDir, fileName)
+                    if (downloadedFile.exists()) {
+                        installApk(ctx, downloadedFile)
+                    } else {
+                        Toast.makeText(ctx, "Download failed. Try again.", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(
+                    receiver,
+                    IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+                    Context.RECEIVER_EXPORTED
+                )
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                context.registerReceiver(
+                    receiver,
+                    IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+                )
+            }
+        } catch (e: Exception) {
+            Toast.makeText(context, "Download error: ${e.message}", Toast.LENGTH_LONG).show()
+            // Fallback: open in browser
+            openDownload(context, downloadUrl)
+        }
+    }
+
+    /**
+     * Launches the Android package installer for the given APK file.
+     */
+    private fun installApk(context: Context, apkFile: File) {
+        try {
+            val contentUri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                apkFile
+            )
+
+            val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(contentUri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(installIntent)
+        } catch (e: Exception) {
+            // Fallback for older devices or if FileProvider fails
+            try {
+                val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(
+                        Uri.fromFile(apkFile),
+                        "application/vnd.android.package-archive"
+                    )
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(installIntent)
+            } catch (e2: Exception) {
+                Toast.makeText(context, "Install failed: ${e2.message}", Toast.LENGTH_LONG).show()
+            }
         }
     }
 

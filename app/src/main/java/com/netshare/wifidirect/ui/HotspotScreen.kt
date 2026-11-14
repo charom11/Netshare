@@ -250,7 +250,7 @@ fun HotspotScreen(
                                 OutlinedButton(
                                     onClick = {
                                         val rawUrl = "https://github.com/$repoOwnerInput/$repoNameInput/raw/main/NetShareDirect.apk"
-                                        GitHubUpdateChecker.openDownload(context, rawUrl)
+                                        GitHubUpdateChecker.downloadAndInstall(context, rawUrl, "latest")
                                     },
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
@@ -266,12 +266,12 @@ fun HotspotScreen(
                 if (res != null && res.hasUpdate && res.downloadUrl.isNotEmpty()) {
                     Button(
                         onClick = {
-                            GitHubUpdateChecker.openDownload(context, res.downloadUrl)
+                            GitHubUpdateChecker.downloadAndInstall(context, res.downloadUrl, res.tagName)
                             showUpdateDialog = false
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = Emerald500)
                     ) {
-                        Text("Download Update")
+                        Text("Download & Install Update")
                     }
                 } else {
                     Button(

@@ -22,6 +22,14 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * Pure Kotlin Userspace Tunnel that intercepts raw packets from the VPN TUN interface
  * and bridges them to the NetShare Direct Gateway at 192.168.49.1:8282.
+ *
+ * Key fixes for "Connected but no internet":
+ * 1. DNS queries go DIRECTLY to 8.8.8.8 (or 1.1.1.1 fallback) via a protected UDP socket,
+ *    bypassing the gateway entirely — the Host phone's DNS Forwarder may be on port 5353
+ *    (not 53) when non-root, so sending to gateway:53 would fail silently.
+ * 2. TCP response data from the proxy is segmented to fit inside TUN MTU (max ~1400 bytes
+ *    per IP packet), preventing silent drops of oversized packets.
+ * 3. Better error logging and connection retry logic.
  */
 class TunToProxyEngine(
     private val tunFd: FileDescriptor,
@@ -42,6 +50,12 @@ class TunToProxyEngine(
 
     private val tcpConnections = ConcurrentHashMap<String, TcpSession>()
 
+    // DNS servers to query directly (bypassing the gateway)
+    private val dnsServers = listOf("8.8.8.8", "1.1.1.1")
+
+    // Max TCP payload per TUN write to avoid exceeding MTU
+    private val maxTcpSegmentPayload = 1400
+
     private class TcpSession(
         val key: String,
         val srcIpBytes: ByteArray,
@@ -58,7 +72,7 @@ class TunToProxyEngine(
 
     fun start() {
         stop()
-        onLog("TUN-to-Proxy Engine started (Target Gateway: $gatewayHost:$gatewayPort)")
+        onLog("TUN Engine started → Gateway $gatewayHost:$gatewayPort | DNS direct to ${dnsServers[0]}")
 
         engineJob = scope.launch {
             val buffer = ByteArray(32768)
@@ -70,7 +84,7 @@ class TunToProxyEngine(
                     totalRxBytes.addAndGet(readLen.toLong())
                     val ipPacket = PacketUtils.parseIp(buffer, readLen) ?: continue
 
-                    // Ignore loopback or direct traffic to the gateway port itself
+                    // Skip traffic destined to the gateway proxy port itself (avoid loop)
                     if (ipPacket.dstIp == gatewayHost && ipPacket.ipPayloadOffset + 4 <= readLen) {
                         val dstPort = ((buffer[ipPacket.ipPayloadOffset + 2].toInt() and 0xFF) shl 8) or
                             (buffer[ipPacket.ipPayloadOffset + 3].toInt() and 0xFF)
@@ -81,22 +95,23 @@ class TunToProxyEngine(
                         PacketUtils.PROTOCOL_ICMP -> {
                             val reply = PacketUtils.buildIcmpReply(buffer, readLen)
                             if (reply != null) {
-                                synchronized(tunOut) {
-                                    tunOut.write(reply)
-                                }
-                                totalTxBytes.addAndGet(reply.size.toLong())
+                                sendToTun(reply)
                             }
                         }
 
                         PacketUtils.PROTOCOL_UDP -> {
                             val udpPacket = PacketUtils.parseUdp(buffer, ipPacket) ?: continue
-                            // Handle DNS queries (port 53)
                             if (udpPacket.dstPort == 53) {
-                                val dnsQuery = buffer.copyOfRange(udpPacket.payloadOffset, udpPacket.payloadOffset + udpPacket.payloadLength)
+                                // DNS — forward directly to public DNS via protected socket
+                                val dnsQuery = buffer.copyOfRange(
+                                    udpPacket.payloadOffset,
+                                    udpPacket.payloadOffset + udpPacket.payloadLength
+                                )
                                 launch {
-                                    forwardDns(ipPacket, udpPacket, dnsQuery)
+                                    forwardDnsDirect(ipPacket, udpPacket, dnsQuery)
                                 }
                             }
+                            // Other UDP: silently drop (VPN tunnel only handles TCP + DNS)
                         }
 
                         PacketUtils.PROTOCOL_TCP -> {
@@ -118,7 +133,7 @@ class TunToProxyEngine(
     ) {
         val key = "${tcp.srcPort}:${ip.dstIp}:${tcp.dstPort}"
 
-        // 1. Connection initiation: SYN
+        // 1. SYN — new connection
         if ((tcp.flags and PacketUtils.TCP_FLAG_SYN) != 0 && (tcp.flags and PacketUtils.TCP_FLAG_ACK) == 0) {
             val initialServerSeq = (Math.random() * 1000000).toLong()
             val session = TcpSession(
@@ -132,7 +147,7 @@ class TunToProxyEngine(
             )
             tcpConnections[key] = session
 
-            // Reply with SYN-ACK immediately
+            // SYN-ACK back immediately
             val synAck = PacketUtils.buildTcpPacket(
                 srcIp = ip.dstIpBytes,
                 dstIp = ip.srcIpBytes,
@@ -145,7 +160,7 @@ class TunToProxyEngine(
             session.serverSeq = (session.serverSeq + 1) and 0xFFFFFFFFL
             sendToTun(synAck)
 
-            // Connect to NetShare Gateway via HTTP CONNECT
+            // Connect upstream via HTTP CONNECT
             scope.launch {
                 initiateProxyConnection(session, ip.dstIp, tcp.dstPort)
             }
@@ -154,17 +169,16 @@ class TunToProxyEngine(
 
         val session = tcpConnections[key] ?: return
 
-        // 2. Client ACK after SYN-ACK or connection close
+        // 2. RST or FIN — close
         if ((tcp.flags and PacketUtils.TCP_FLAG_RST) != 0 || (tcp.flags and PacketUtils.TCP_FLAG_FIN) != 0) {
             closeSession(session, sendFin = true)
             return
         }
 
-        // 3. Client data payload
+        // 3. Data payload — forward to gateway
         if (tcp.payloadLength > 0) {
             session.clientSeq = (tcp.seqNumber + tcp.payloadLength) and 0xFFFFFFFFL
 
-            // ACK the data packet back to TUN
             val ackPacket = PacketUtils.buildTcpPacket(
                 srcIp = session.dstIpBytes,
                 dstIp = session.srcIpBytes,
@@ -176,7 +190,6 @@ class TunToProxyEngine(
             )
             sendToTun(ackPacket)
 
-            // Forward payload to the proxy socket
             val payload = rawPacket.copyOfRange(tcp.payloadOffset, tcp.payloadOffset + tcp.payloadLength)
             scope.launch {
                 try {
@@ -190,36 +203,36 @@ class TunToProxyEngine(
     }
 
     private fun initiateProxyConnection(session: TcpSession, targetHost: String, targetPort: Int) {
-        var proxySocket: Socket? = null
         try {
             val socket = Socket()
             socket.tcpNoDelay = true
             socket.soTimeout = 30_000
-            // Protect socket so its outbound traffic bypasses the VPN tunnel!
+            socket.sendBufferSize = 65536
+            socket.receiveBufferSize = 65536
             if (!protectSocket(socket)) {
-                onLog("Failed to protect outbound proxy socket")
+                onLog("WARN: Failed to protect proxy socket for $targetHost:$targetPort")
             }
 
-            socket.connect(InetSocketAddress(gatewayHost, gatewayPort), 8000)
-            proxySocket = socket
+            socket.connect(InetSocketAddress(gatewayHost, gatewayPort), 10_000)
             session.socket = socket
 
             val out = socket.getOutputStream()
             val input = socket.getInputStream()
             session.socketOut = out
 
-            // Send HTTP CONNECT to gateway
+            // HTTP CONNECT handshake
             val connectReq = "CONNECT $targetHost:$targetPort HTTP/1.1\r\nHost: $targetHost:$targetPort\r\n\r\n"
             out.write(connectReq.toByteArray(Charsets.ISO_8859_1))
             out.flush()
 
-            // Read HTTP 200 response
+            // Read response
             val respLine = readLine(input)
             if (respLine == null || !respLine.contains("200")) {
+                onLog("CONNECT rejected for $targetHost:$targetPort → $respLine")
                 closeSession(session, sendFin = true)
                 return
             }
-            // Consume remaining headers
+            // Consume remaining headers until blank line
             while (true) {
                 val line = readLine(input)
                 if (line.isNullOrEmpty()) break
@@ -227,71 +240,80 @@ class TunToProxyEngine(
 
             session.isEstablished = true
 
-            // Read data from proxy and inject back into TUN as TCP packets
-            val buf = ByteArray(16384)
+            // Read upstream data and inject back into TUN as segmented TCP packets
+            val buf = ByteArray(32768)
             while (!session.isClosed && socket.isConnected && !socket.isClosed) {
                 val n = input.read(buf)
                 if (n <= 0) break
 
-                val chunk = buf.copyOf(n)
-                val dataPacket = PacketUtils.buildTcpPacket(
-                    srcIp = session.dstIpBytes,
-                    dstIp = session.srcIpBytes,
-                    srcPort = session.dstPort,
-                    dstPort = session.srcPort,
-                    seqNumber = session.serverSeq,
-                    ackNumber = session.clientSeq,
-                    flags = PacketUtils.TCP_FLAG_ACK or PacketUtils.TCP_FLAG_PSH,
-                    payload = chunk
-                )
-                session.serverSeq = (session.serverSeq + n) and 0xFFFFFFFFL
-                sendToTun(dataPacket)
+                // Segment the response into MTU-safe chunks
+                var offset = 0
+                while (offset < n && !session.isClosed) {
+                    val chunkSize = minOf(maxTcpSegmentPayload, n - offset)
+                    val chunk = buf.copyOfRange(offset, offset + chunkSize)
+
+                    val dataPacket = PacketUtils.buildTcpPacket(
+                        srcIp = session.dstIpBytes,
+                        dstIp = session.srcIpBytes,
+                        srcPort = session.dstPort,
+                        dstPort = session.srcPort,
+                        seqNumber = session.serverSeq,
+                        ackNumber = session.clientSeq,
+                        flags = PacketUtils.TCP_FLAG_ACK or PacketUtils.TCP_FLAG_PSH,
+                        payload = chunk
+                    )
+                    session.serverSeq = (session.serverSeq + chunkSize) and 0xFFFFFFFFL
+                    sendToTun(dataPacket)
+                    offset += chunkSize
+                }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            onLog("Proxy connection error for ${session.key}: ${e.message}")
         } finally {
             closeSession(session, sendFin = true)
         }
     }
 
-    private fun forwardDns(
+    /**
+     * Forward DNS queries DIRECTLY to public DNS servers (8.8.8.8, 1.1.1.1)
+     * via a VPN-protected UDP socket. This completely bypasses the gateway,
+     * solving the problem where Phone 1's DNS forwarder binds to port 5353
+     * (unreachable on port 53 without root iptables redirect).
+     */
+    private fun forwardDnsDirect(
         ip: PacketUtils.ParsedIpPacket,
         udp: PacketUtils.ParsedUdpPacket,
         dnsQuery: ByteArray
     ) {
-        var udpSocket: DatagramSocket? = null
-        try {
-            udpSocket = DatagramSocket()
-            udpSocket.soTimeout = 4000
-            protectDatagram(udpSocket)
-
-            // Send query to Phone 1 DNS forwarder (192.168.49.1:53) or fallback 8.8.8.8
-            val targetDns = try {
-                InetAddress.getByName(gatewayHost)
-            } catch (_: Exception) {
-                InetAddress.getByName("8.8.8.8")
-            }
-
-            val outPacket = DatagramPacket(dnsQuery, dnsQuery.size, targetDns, 53)
-            udpSocket.send(outPacket)
-
-            val recvBuf = ByteArray(1500)
-            val inPacket = DatagramPacket(recvBuf, recvBuf.size)
-            udpSocket.receive(inPacket)
-
-            val replyDns = inPacket.data.copyOf(inPacket.length)
-            val replyIpPacket = PacketUtils.buildUdpPacket(
-                srcIp = ip.dstIpBytes,
-                dstIp = ip.srcIpBytes,
-                srcPort = udp.dstPort,
-                dstPort = udp.srcPort,
-                payload = replyDns
-            )
-            sendToTun(replyIpPacket)
-        } catch (_: Exception) {
-        } finally {
+        for (dnsServer in dnsServers) {
+            var udpSocket: DatagramSocket? = null
             try {
-                udpSocket?.close()
+                udpSocket = DatagramSocket()
+                udpSocket.soTimeout = 3000
+                protectDatagram(udpSocket)
+
+                val targetDns = InetAddress.getByName(dnsServer)
+                val outPacket = DatagramPacket(dnsQuery, dnsQuery.size, targetDns, 53)
+                udpSocket.send(outPacket)
+
+                val recvBuf = ByteArray(1500)
+                val inPacket = DatagramPacket(recvBuf, recvBuf.size)
+                udpSocket.receive(inPacket)
+
+                val replyDns = inPacket.data.copyOf(inPacket.length)
+                val replyIpPacket = PacketUtils.buildUdpPacket(
+                    srcIp = ip.dstIpBytes,
+                    dstIp = ip.srcIpBytes,
+                    srcPort = udp.dstPort,
+                    dstPort = udp.srcPort,
+                    payload = replyDns
+                )
+                sendToTun(replyIpPacket)
+                return // Success, don't try fallback
             } catch (_: Exception) {
+                // Try next DNS server
+            } finally {
+                try { udpSocket?.close() } catch (_: Exception) {}
             }
         }
     }
@@ -300,6 +322,7 @@ class TunToProxyEngine(
         try {
             synchronized(tunOut) {
                 tunOut.write(packet)
+                tunOut.flush()
             }
             totalTxBytes.addAndGet(packet.size.toLong())
         } catch (_: Exception) {
@@ -324,10 +347,7 @@ class TunToProxyEngine(
             sendToTun(finPacket)
         }
 
-        try {
-            session.socket?.close()
-        } catch (_: Exception) {
-        }
+        try { session.socket?.close() } catch (_: Exception) {}
     }
 
     private fun readLine(input: InputStream): String? {
@@ -346,14 +366,7 @@ class TunToProxyEngine(
         engineJob = null
         tcpConnections.values.forEach { closeSession(it, sendFin = false) }
         tcpConnections.clear()
-        try {
-            tunIn.close()
-        } catch (_: Exception) {
-        }
-        try {
-            tunOut.close()
-        } catch (_: Exception) {
-        }
+        try { tunIn.close() } catch (_: Exception) {}
+        try { tunOut.close() } catch (_: Exception) {}
     }
 }
-
