@@ -1,52 +1,71 @@
-# NetShare Direct — Android Wi-Fi Direct Hotspot (No Proxy / No VPN)
+# NetShare Direct — Android Wi-Fi Direct Hotspot
 
-**NetShare Direct** is a native Android application written in **Kotlin + Jetpack Compose** that creates a **Wi-Fi Direct Autonomous Group Owner (Hotspot)** and shares the host device's active internet connection (Wi-Fi Repeater mode or Mobile Data) over the `p2p-*` interface (`192.168.49.1/24`) **without requiring any HTTP/SOCKS Proxy or VPN client**.
+**NetShare Direct** is a native Android application built with **Kotlin + Jetpack Compose** that creates a **Wi-Fi Direct Autonomous Group Owner (Hotspot)** to share the host device's internet connection (Wi-Fi-to-Wi-Fi repeater or Mobile Data) across devices.
 
 ---
 
 ## Key Features
 
-1. **Wi-Fi Direct Autonomous Group Owner (Legacy AP Compatible)**
-   - Uses Android's `WifiP2pManager` (`createGroup`) to broadcast a standard WPA2 Wi-Fi network (`DIRECT-NS-<CustomName>`).
-   - Any device (Android, iOS, Windows, macOS, Linux, Smart TVs, consoles) can join it from its normal Wi-Fi list using the WPA2 password or the built-in **Wi-Fi QR Code** — no Wi-Fi Direct pairing required on client devices.
-   - Supports custom SSID, custom WPA2 passphrase (8–63 characters), and frequency band selection (**Auto**, **2.4 GHz**, **5 GHz**) via `WifiP2pConfig.Builder` on Android 10+ (with automatic fallback for Android 8–9).
+1. **Wi-Fi Direct Hotspot (Legacy AP Mode)**
+   - Uses Android `WifiP2pManager` to broadcast a standard WPA2 network (`DIRECT-NS-<CustomName>`).
+   - Clients (phones, laptops, tablets, Smart TVs) connect directly from their regular Wi-Fi list or by scanning the in-app **Wi-Fi QR Code**.
+   - Custom SSID, WPA2 passphrase (8–63 chars), and band selection (**Auto**, **2.4 GHz**, **5 GHz**).
 
-2. **Native Layer-3 Routing Engine (No Proxy / No VPN)**
-   - **Auto Upstream Detection (`UpstreamNetworkTracker`)**: Automatically detects and tracks the active internet interface (`wlan0` for Wi-Fi-to-Wi-Fi repeating, `rmnet_data*` / `ccmni*` for Mobile Data, or `eth0` for Ethernet).
-   - **Kernel `iptables` + Android Policy Routing (`NativeNatRouter`)**:
-     - Enables IPv4 packet forwarding (`/proc/sys/net/ipv4/ip_forward`).
-     - Configures `iptables -t nat POSTROUTING -s 192.168.49.0/24 -o <upstream> -j MASQUERADE`.
-     - Configures `FORWARD` chain rules and `TCPMSS --clamp-mss-to-pmtu` so HTTPS/TLS traffic over cellular data never stalls on MTU mismatches.
-     - Configures Android's multi-table policy routing (`ip rule` + `ip route` for `192.168.49.0/24` -> `<upstream_table>`) so `netd` fwmark policy routing forwards client packets transparently.
-   - **System `ndc` Tethering Controller Mode**: Supports Android's native `ndc ipfwd` and `ndc nat enable` commands.
-   - **Upstream Socket-Bound DNS Forwarder (`DnsForwarder`)**: Binds a UDP DNS resolver on `192.168.49.1` and forwards client DNS queries directly over the active upstream `android.net.Network` using `Network.bindSocket(DatagramSocket)`.
+2. **Dual-Path Routing & Gateway Engine**
+   - **Root Mode:** Full kernel `iptables` NAT masquerading, `ip rule` multi-table routing (priority 5000), TCP MSS clamping, and native packet forwarding.
+   - **Non-Root Mode:** High-speed Userspace Gateway (`192.168.49.1:8282`) supporting HTTP CONNECT, full RFC 1928 SOCKS5, and PAC auto-configuration (`/pac`).
+   - **Built-in RFC 2131 DHCP Server:** Automatically serves IP leases (`192.168.49.100–.240`), gateway `192.168.49.1`, and DNS.
+   - **Captive Portal 204 Responder:** Responds to Google/Android `generate_204` checks with `204 No Content` to prevent Android's "No internet access" warning.
 
-3. **Always-On Foreground Service & Live Telemetry**
-   - Runs as a `connectedDevice` Foreground Service (`WifiDirectHotspotService`) holding a `PARTIAL_WAKE_LOCK` and `WIFI_MODE_FULL_LOW_LATENCY` lock so the hotspot stays active when the screen is off.
-   - Real-time download/upload bandwidth monitor (`TrafficMonitor`) reading `/sys/class/net/<p2p_iface>/statistics` and `/proc/net/dev`.
-   - Connected clients table resolving peer MAC addresses to `192.168.49.x` IPv4 addresses via `/proc/net/arp` and `ip neigh`.
+3. **In-App GitHub Update Checker & Automated CI/CD**
+   - Built-in GitHub update checker dialog in the app: tap the download cloud icon in the top bar to check for new releases and download the latest APK in one tap.
+   - GitHub Actions workflow (`.github/workflows/build.yml`) automatically builds the APK and creates GitHub Releases whenever you push or tag.
 
 ---
 
-## Project Structure
+## Pushing to Your GitHub Repository
 
-- [`app/src/main/AndroidManifest.xml`](app/src/main/AndroidManifest.xml) — Permissions (`NEARBY_WIFI_DEVICES`, `ACCESS_FINE_LOCATION`, `CHANGE_WIFI_STATE`, `CHANGE_NETWORK_STATE`, `FOREGROUND_SERVICE_CONNECTED_DEVICE`) and service declarations.
-- [`app/src/main/java/com/netshare/wifidirect/p2p/WifiDirectManager.kt`](app/src/main/java/com/netshare/wifidirect/p2p/WifiDirectManager.kt) — Wi-Fi P2P Autonomous Group Owner lifecycle, custom SSID/passphrase/band builder, and peer list management.
-- [`app/src/main/java/com/netshare/wifidirect/routing/NativeNatRouter.kt`](app/src/main/java/com/netshare/wifidirect/routing/NativeNatRouter.kt) — Native `iptables` NAT masquerading, `ip rule` multi-table routing, `ndc` tethering, and ARP/neighbor IP resolution.
-- [`app/src/main/java/com/netshare/wifidirect/routing/DnsForwarder.kt`](app/src/main/java/com/netshare/wifidirect/routing/DnsForwarder.kt) — Upstream `Network.bindSocket` UDP DNS forwarder on `192.168.49.1`.
-- [`app/src/main/java/com/netshare/wifidirect/routing/UpstreamNetworkTracker.kt`](app/src/main/java/com/netshare/wifidirect/routing/UpstreamNetworkTracker.kt) — Tracks the active upstream internet interface (`wlan0`, `rmnet_data0`, `eth0`).
-- [`app/src/main/java/com/netshare/wifidirect/service/WifiDirectHotspotService.kt`](app/src/main/java/com/netshare/wifidirect/service/WifiDirectHotspotService.kt) — Foreground service with WakeLock/WifiLock and live speed notification.
-- [`app/src/main/java/com/netshare/wifidirect/ui/HotspotScreen.kt`](app/src/main/java/com/netshare/wifidirect/ui/HotspotScreen.kt) — Jetpack Compose Material 3 UI dashboard, QR code sheet, connected clients list, and live diagnostics console.
+The local Git repository is already initialized with a clean initial commit. To push it to your GitHub account:
 
----
-
-## Building & Running
-
-1. Open `d:\Netshare` in **Android Studio** (Iguana / Jellyfish / Koala or newer).
-2. Let Android Studio sync Gradle and download the Android SDK / Gradle 8.7 distribution.
-3. Connect a physical Android device (Wi-Fi Direct requires real Wi-Fi hardware; emulators do not support `WifiP2pManager` Group Owner mode) and click **Run (`Shift+F10`)**, or build an APK via:
+1. Create a new repository on [GitHub](https://github.com/new) (e.g., named `Netshare`).
+2. Run these commands:
    ```bash
-   ./gradlew assembleDebug
+   git remote add origin https://github.com/<YOUR-GITHUB-USERNAME>/Netshare.git
+   git branch -M main
+   git push -u origin main
    ```
-   The output APK will be generated at `app/build/outputs/apk/debug/app-debug.apk`.
 
+### Automated Updates via GitHub Actions:
+* **On every push to `main`:** GitHub Actions will compile `NetShareDirect.apk` and attach it as a downloadable artifact in the **Actions** tab.
+* **To create a release:** Create a git tag (e.g. `v1.0.1`):
+  ```bash
+  git tag v1.0.1
+  git push origin v1.0.1
+  ```
+  GitHub Actions will automatically publish a new **GitHub Release** with the downloadable `NetShareDirect.apk` attached!
+* **In the App:** Tap the cloud update icon at the top to check GitHub and download the update immediately.
+
+---
+
+## Getting Internet on the 2nd Phone (Client Phone)
+
+Because non-rooted Android restricts raw layer-3 kernel packet forwarding:
+1. Connect the 2nd phone to the hotspot Wi-Fi (`DIRECT-NS-NetShare`).
+2. On the 2nd phone, install a free proxy-to-VPN tunnel app (like **Super Proxy** or **Every Proxy** from Google Play).
+3. Set:
+   - **Type:** `HTTP` or `SOCKS5`
+   - **Server / Host:** `192.168.49.1`
+   - **Port:** `8282`
+4. Tap **Start** and allow the VPN permission prompt.
+5. All apps, games, YouTube, WhatsApp, and browsers on the 2nd phone will now have full internet!
+
+*(For PC or Mac: simply set Wi-Fi proxy to `192.168.49.1:8282` in Windows/macOS network settings).*
+
+---
+
+## Building Locally
+
+```powershell
+.\gradlew.bat assembleDebug
+```
+The output APK is at `app/build/outputs/apk/debug/app-debug.apk` and `NetShareDirect.apk`.
