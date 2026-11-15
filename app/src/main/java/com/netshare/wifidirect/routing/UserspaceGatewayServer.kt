@@ -323,6 +323,14 @@ class UserspaceGatewayServer(
         input.read() // RSV
         val atyp = input.read()
         if (reqVer != 5 || cmd != 1) { // 1 = CONNECT
+            if (reqVer == 5) {
+                // Command not supported (0x07) according to RFC 1928
+                try {
+                    output.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                    output.flush()
+                } catch (_: Exception) {
+                }
+            }
             client.close()
             return
         }
@@ -421,6 +429,7 @@ class UserspaceGatewayServer(
         remoteIn: InputStream,
         remoteOut: OutputStream
     ) {
+        var clientErrored = false
         val upJob = scope.launch {
             try {
                 val buf = ByteArray(32 * 1024)
@@ -431,10 +440,21 @@ class UserspaceGatewayServer(
                     remoteOut.flush()
                 }
             } catch (_: Exception) {
+                clientErrored = true
             } finally {
                 try {
                     remote.shutdownOutput()
                 } catch (_: Exception) {
+                }
+                if (clientErrored) {
+                    try {
+                        remote.close()
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        client.close()
+                    } catch (_: Exception) {
+                    }
                 }
             }
         }

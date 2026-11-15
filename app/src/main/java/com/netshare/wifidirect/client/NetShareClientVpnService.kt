@@ -43,6 +43,12 @@ class NetShareClientVpnService : VpnService() {
         createNotificationChannel()
     }
 
+    override fun onRevoke() {
+        log("VPN interface revoked by system or user.")
+        stopClient()
+        super.onRevoke()
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP_CLIENT -> {
@@ -60,6 +66,21 @@ class NetShareClientVpnService : VpnService() {
     }
 
     private fun startClient(host: String, port: Int) {
+        if (vpnInterface != null) {
+            log("Restarting client session...")
+            try {
+                TProxyService.TProxyStopService()
+            } catch (_: Exception) {
+            }
+            try {
+                vpnInterface?.close()
+            } catch (_: Exception) {
+            }
+            vpnInterface = null
+            monitorJob?.cancel()
+            monitorJob = null
+        }
+
         _clientState.update {
             it.copy(
                 status = ClientConnectionStatus.CONNECTING,
