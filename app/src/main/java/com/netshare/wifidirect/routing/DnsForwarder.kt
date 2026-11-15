@@ -137,6 +137,13 @@ class DnsForwarder(
         upstreamDnsServer: String,
         upstreamNetwork: Network?
     ) {
+        // Security ACL: Only answer DNS queries from trusted Wi-Fi Direct subnet or loopback
+        val isLoopback = clientAddress.isLoopbackAddress || clientAddress.hostAddress == "127.0.0.1"
+        val isAllowedSubnet = clientAddress.hostAddress?.startsWith("192.168.49.") == true
+        if (!isLoopback && !isAllowedSubnet) {
+            return
+        }
+
         val upstreamList = listOf(upstreamDnsServer, "8.8.8.8", "1.1.1.1").distinct()
 
         for (targetServer in upstreamList) {

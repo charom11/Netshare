@@ -60,8 +60,8 @@ class NativeNatRouter(
         speedLimit: SpeedLimitPreset = SpeedLimitPreset.UNLIMITED,
         upstreamNetworkProvider: () -> Network?
     ): RoutingResult = withContext(Dispatchers.IO) {
-        val cleanP2p = p2pInterface.trim().ifEmpty { "p2p-wlan0-0" }
-        val cleanUpstream = upstreamInterface.trim().ifEmpty { "wlan0" }
+        val cleanP2p = p2pInterface.trim().filter { it.isLetterOrDigit() || it == '-' || it == '_' || it == '.' }.ifEmpty { "p2p-wlan0-0" }
+        val cleanUpstream = upstreamInterface.trim().filter { it.isLetterOrDigit() || it == '-' || it == '_' || it == '.' }.ifEmpty { "wlan0" }
 
         activeP2pInterface = cleanP2p
         activeUpstreamInterface = cleanUpstream

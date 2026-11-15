@@ -83,6 +83,23 @@ class UserspaceGatewayServer(
         upstreamNetworkProvider: () -> Network?
     ) {
         try {
+            // Security ACL: Only allow connections from trusted Wi-Fi Direct subnet or loopback
+            val remoteAddr = client.inetAddress
+            val isLoopback = remoteAddr.isLoopbackAddress || remoteAddr.hostAddress == "127.0.0.1"
+            val subnetPrefix = if (groupOwnerIp.contains(".")) {
+                groupOwnerIp.substringBeforeLast(".") + "."
+            } else {
+                "192.168.49."
+            }
+            val isAllowedSubnet = remoteAddr.hostAddress?.startsWith(subnetPrefix) == true ||
+                remoteAddr.hostAddress?.startsWith("192.168.49.") == true
+
+            if (!isLoopback && !isAllowedSubnet) {
+                // Reject unauthorized connection from external or upstream network
+                client.close()
+                return
+            }
+
             client.soTimeout = 30_000
             val input = BufferedInputStream(client.getInputStream())
             val output = client.getOutputStream()
